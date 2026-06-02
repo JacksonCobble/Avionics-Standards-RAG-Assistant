@@ -1,0 +1,11 @@
+langchain
+langchain-community
+langchain-openai
+chromadb
+fastapi
+uvicorn
+streamlit
+psycopg[binary]
+python-dotenv
+pypdf
+openai
