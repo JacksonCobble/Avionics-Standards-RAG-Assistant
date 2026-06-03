@@ -1,6 +1,7 @@
 langchain
 langchain-community
 langchain-openai
+langchain-chroma
 chromadb
 fastapi
 uvicorn
