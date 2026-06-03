@@ -11,8 +11,8 @@ from langchain_chroma import Chroma
 load_dotenv()
 
 # CONFIG
-DOCS_DIR = Path("docs")
-CHROMA_DIR = Path(os.getenv("CHROMA_DIR"))
+DOCS_DIR = Path("docs").resolve() 
+CHROMA_DIR = Path(os.getenv("CHROMA_DIR")).resolve()
 COLLECTION_NAME = os.getenv("COLLECTION_NAME")
 CHUNK_SIZE = 1500 # size of each chunk our docs will be split into
 CHUNK_OVERLAP = 150 # how many characters of overlap between chunks (to maintain context)
@@ -21,6 +21,7 @@ EMBED_MODEL = "text-embedding-3-small" # OpenAI's small embedding model thats co
 # makes hashes of files, used to skip re ingesting docs that havent changed
 def hash_file(path: Path) -> str:
     hash = hashlib.sha256()
+    # make sure to resolve file to get absolute path, otherwise we can get different hashes for the same file if we run the script from different directories
     with open(path.resolve(), "rb") as f:
         # Read and update hash string value in blocks of 8K in order to handle large files efficiently
         for byte_block in iter(lambda: f.read(8192), b""):
@@ -102,4 +103,18 @@ if __name__ == "__main__":
     print("[3/4] Creating embeddings and persisting to ChromaDB...")
     print(f" - Model: {EMBED_MODEL}")
     print(f" - Collection name: {COLLECTION_NAME}")
-    print(f" - ChromaDB directory: {CHROMA_DIR.resolve()}")
+    print(f" - ChromaDB directory: {CHROMA_DIR}")
+
+    embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
+
+    # if collection already exists, add to it. if collection is brand new, add_documents will create it
+    vectorstore = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, persist_directory=str(CHROMA_DIR))
+    vectorstore.add_documents(chunks)
+
+    # 4. Record all hashes so we can skip these files in the next run
+    # ----------------------------------------------------------------------------------------------------------        
+    print("[4/4] Updating ingested hashes ledger...")
+    for hash in new_hashes:
+        save_ingested_hash(hash)
+
+    print(f"\nDone! Ingested {len(new_hashes)} new docs, split into {len(chunks)} chunks.")
