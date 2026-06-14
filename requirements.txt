@@ -10,3 +10,4 @@ psycopg[binary]
 python-dotenv
 pypdf
 openai
+pydantic
