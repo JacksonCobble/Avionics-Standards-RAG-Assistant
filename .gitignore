@@ -5,3 +5,4 @@ __pycache__/
 chroma_db/
 *.pdf
 docs/
+.DS_Store
