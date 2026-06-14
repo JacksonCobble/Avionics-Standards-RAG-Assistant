@@ -120,6 +120,7 @@ def build_prompt(question: str) -> str:
 def query_chatgpt_with_prompt(prompt: str) -> None:
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+    #create a wrap around prompt string on gpt 4-0 mini. temperature being at 0 lowers randomness in vocabulary
     completion = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.0,
@@ -136,6 +137,7 @@ def query_chatgpt_with_prompt(prompt: str) -> None:
         ],
     )
 
+    # get answer and print it
     answer = completion.choices[0].message.content
     print("\n=== LLM ANSWER ===")
     print(answer)
