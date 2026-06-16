@@ -14,13 +14,23 @@ from openai import OpenAI
 # DATA VALIDATION
 from models import QueryRequest, QueryResponse, Source
 
-# prep environment
+########################################################################
+# ENVIRONMENT SETUP
+########################################################################
+
 load_dotenv()
 
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-CHROMA_PATH     = os.getenv("CHROMA_PATH", "chroma_db")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL")
+EMBED_MODEL = os.getenv("EMBED_MODEL")
+
+CHROMA_PATH = os.getenv("CHROMA_PATH", "chroma_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME")
 
+
+########################################################################
+# FASTAPI APP, STARTUP AND SHUTDOWN
+########################################################################
 
 # use lifespan func as a constructor to prep environment for fasAPI app
 @asynccontextmanager
@@ -48,6 +58,70 @@ async def lifespan(app: FastAPI):
     yield
 
     print("[shutdown] Closing down.")
+
+########################################################################
+# LLM FUNCTIONS
+########################################################################
+
+# embed text and return its vector
+def embed(client: OpenAI, text: str) -> list[float]:
+    response = client.embeddings.create(model=EMBED_MODEL, input=text)
+    return response.data[0].embedding
+
+# retrieve n relevant chunks from chromaDB for a given vector
+def retrieve(collection, vector: list[float], n: int) -> tuple[list[str], list[dict]]:
+    results = collection.query(
+        query_embeddings=[vector],
+        n_results=n,
+        include=["documents", "metadatas", "distances"]
+    )
+    # query designed to handle batches- because we are using a singular query, we can use the first element returned as there will only be 1
+    return results["documents"][0], results["metadatas"][0]
+
+def build_context_block(docs: list[str], metas: list[dict]) -> str:
+    parts = []
+    #go over each chunk and its metadata
+    for i, (doc, meta) in enumerate(zip(docs, metas), 1):
+        source = meta.get("source", "unknown source")
+        page = meta.get("page", "unknown page")
+        # format chunk information in a block to build cohesive prompt for LLM
+        parts.append(f"[Chunk {i} | Source {source} | Page: {page}]\n{doc}")
+    return "\n\n---\n\n".join(parts)
+
+def call_llm(client: OpenAI, question: str, context: str) -> str:
+    # try to make format of prompt good looking enough to feel like its well written
+    prompt = (f"You are a technical expert on avionics data bus standards.\n"
+                f"Answer the question below using ONLY the provided context.\n"
+                f"If the context does not contain enough information, say so — do not speculate.\n"
+                f"When you cite a fact, reference its source and page like this: [SOURCE: filename, p.N].\n\n"
+                f"CONTEXT: {context}\n\n"
+                f"QUESTION: {question} \n\n"
+                f"ANSWER:")
+
+    # query model with prompt
+    completion = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=0.0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a precise technical assistant for avionics standards. "
+                    "Answer only from provided context. "
+                    "Never fabricate specifications or figures."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    # return answer
+    return completion.choices[0].message.content.strip()
+
+
+########################################################################
+# FASTAPI ENDPOINTS
+########################################################################
 
 app = FastAPI(title="Avionics RAG API", lifespan=lifespan)
 
