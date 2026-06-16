@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import time
 
 # DB
 import chromadb
@@ -78,16 +79,18 @@ def retrieve(collection, vector: list[float], n: int) -> tuple[list[str], list[d
     # query designed to handle batches- because we are using a singular query, we can use the first element returned as there will only be 1
     return results["documents"][0], results["metadatas"][0]
 
-def build_context_block(docs: list[str], metas: list[dict]) -> str:
+# turns list of relevant chunks into a formatted block of text displaying each chunk with its relevant information
+def build_context_block(chunks: list[str], metas: list[dict]) -> str:
     parts = []
     #go over each chunk and its metadata
-    for i, (doc, meta) in enumerate(zip(docs, metas), 1):
+    for i, (doc, meta) in enumerate(zip(chunks, metas), 1):
         source = meta.get("source", "unknown source")
         page = meta.get("page", "unknown page")
         # format chunk information in a block to build cohesive prompt for LLM
         parts.append(f"[Chunk {i} | Source {source} | Page: {page}]\n{doc}")
     return "\n\n---\n\n".join(parts)
 
+# given question and context block, prompt LLM and return answer
 def call_llm(client: OpenAI, question: str, context: str) -> str:
     # try to make format of prompt good looking enough to feel like its well written
     prompt = (f"You are a technical expert on avionics data bus standards.\n"
@@ -114,10 +117,21 @@ def call_llm(client: OpenAI, question: str, context: str) -> str:
             {"role": "user", "content": prompt},
         ],
     )
-
     # return answer
     return completion.choices[0].message.content.strip()
 
+# remove duplicate chunk sources if we have multiple referencing the same page
+def check_for_duplicate_sources(metas: list[dict]) -> list[Source]:
+    seen   = set()
+    result = []
+    # go over each meta and save source and page one time if we dont have a copy of it
+    for m in metas:
+        key = (m.get("source", "unknown"), int(m.get("page", 0)))
+        if key not in seen:
+            seen.add(key)
+            result.append(Source(doc=key[0], page=key[1]))
+    # return our list with duplicates removed
+    return sorted(result, key=lambda s: (s.doc, s.page))
 
 ########################################################################
 # FASTAPI ENDPOINTS
@@ -136,3 +150,34 @@ async def health():
     except Exception as e:
         # exception 503- unable to handle request
         raise HTTPException(status_code=503, detail=f"ChromaDB Unavailable: {str(e)}")
+    
+@app.post("/query", response_model=QueryResponse)
+def query(req: QueryRequest):
+    # start clocking time
+    t0 = time.perf_counter()
+
+    try:
+        # turn question into vector using embedding
+        vector = embed(app.state.openai_client, req.question)
+        # get relevant chunks and sources based on embed vector
+        chunks, metas = retrieve(app.state.collection, vector, req.n_results)
+        # build context block for prompt
+        context = build_context_block(chunks, metas)
+        # build query and get answer from LLM
+        llm_response = call_llm(app.state.openai_client, req.question, context)
+        # remove any dupe sources from chunks
+        no_dupes_sources = check_for_duplicate_sources(metas)
+        #get latency of full operation
+        operation_time_ms = (time.perf_counter() - t0) * 1000
+
+        return QueryResponse(
+            question = req.question,
+            answer = llm_response,
+            sources = no_dupes_sources,
+            chunks_used = len(chunks),
+            latency_ms = round(operation_time_ms, 1)
+        )
+
+    except Exception as e:
+        #error code 500, generic catch all
+        raise HTTPException(status_code=500, detail=str(e))
