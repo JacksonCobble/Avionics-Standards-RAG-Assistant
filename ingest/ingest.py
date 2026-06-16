@@ -16,7 +16,7 @@ CHROMA_DIR = Path(os.getenv("CHROMA_DIR")).resolve()
 COLLECTION_NAME = os.getenv("COLLECTION_NAME")
 CHUNK_SIZE = 1500 # size of each chunk our docs will be split into
 CHUNK_OVERLAP = 150 # how many characters of overlap between chunks (to maintain context)
-EMBED_MODEL = "text-embedding-3-small" # OpenAI's small embedding model thats cost effective 
+EMBED_MODEL = os.getenv("EMBED_MODEL")
 
 # makes hashes of files, used to skip re ingesting docs that havent changed
 def hash_file(path: Path) -> str:

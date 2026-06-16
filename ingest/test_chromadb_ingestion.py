@@ -34,12 +34,13 @@ def query_db() -> None:
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     chroma = chromadb.PersistentClient(path="chroma_db/")
     collection = chroma.get_collection("avionics_standards")
+    embed_model = os.getenv("EMBED_MODEL")
 
     # embed a question
     question = "What is the maximum stub length allowed in MIL-STD-1553?"
 
     response = openai_client.embeddings.create(
-        model="text-embedding-3-small",
+        model=embed_model,
         input=question
     )
 
@@ -76,9 +77,10 @@ def build_prompt(question: str) -> str:
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     chroma = chromadb.PersistentClient(path="chroma_db/")
     collection = chroma.get_collection("avionics_standards")
+    embed_model = os.getenv("EMBED_MODEL")
 
     response = openai_client.embeddings.create(
-        model="text-embedding-3-small",
+        model=embed_model,
         input=question
     )
     vector = response.data[0].embedding
@@ -119,10 +121,11 @@ def build_prompt(question: str) -> str:
 
 def query_chatgpt_with_prompt(prompt: str) -> None:
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     #create a wrap around prompt string on gpt 4-0 mini. temperature being at 0 lowers randomness in vocabulary
     completion = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=model_name,
         temperature=0.0,
         messages=[
             {

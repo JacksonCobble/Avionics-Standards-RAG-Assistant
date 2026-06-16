@@ -1,14 +1,20 @@
+# OS/ENVIRONMENT
 import os
-from contextlib import asynccontextmanager
 from pathlib import Path
-
-import chromadb
 from dotenv import load_dotenv
+
+# DB
+import chromadb
+
+# API/SERVER
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 
+# DATA VALIDATION
 from models import QueryRequest, QueryResponse, Source
 
+# prep environment
 load_dotenv()
 
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
