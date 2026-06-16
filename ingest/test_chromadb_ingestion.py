@@ -145,13 +145,13 @@ def query_chatgpt_with_prompt(prompt: str) -> None:
 
 
 if __name__ == "__main__":
-    # getsamples()
-    # query_db()
+    getsamples()
+    query_db()
 
-    #prompt = build_prompt(question= "What is the maximum stub length allowed in MIL-STD-1553?")
-    #print(prompt)
-    #print("-" * 50)
-    #query_chatgpt_with_prompt(prompt)
+    prompt = build_prompt(question= "What is the maximum stub length allowed in MIL-STD-1553?")
+    print(prompt)
+    print("-" * 50)
+    query_chatgpt_with_prompt(prompt)
 
     badprompt = build_prompt(question= "What is the maximum range of an AIM-9 Sidewinder missile?")
     print(badprompt)
