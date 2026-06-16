@@ -6,6 +6,7 @@ import time
 
 # DB
 import chromadb
+import db_logger
 
 # API/SERVER
 from contextlib import asynccontextmanager
@@ -50,6 +51,9 @@ async def lifespan(app: FastAPI):
     # make sure chroma DB loaded
     count = collection.count()
     print(f"[startup] ChromaDB ready — {count} chunks in '{COLLECTION_NAME}'")
+
+    # initialize response db
+    db_logger.init_db()
 
     # attach clients to app instance
     app.state.collection    = collection
@@ -170,7 +174,8 @@ def query(req: QueryRequest):
         #get latency of full operation
         operation_time_ms = (time.perf_counter() - t0) * 1000
 
-        return QueryResponse(
+        # build response object
+        response =  QueryResponse(
             question = req.question,
             answer = llm_response,
             sources = no_dupes_sources,
@@ -178,6 +183,10 @@ def query(req: QueryRequest):
             latency_ms = round(operation_time_ms, 1)
         )
 
+        # log to response db and return
+        db_logger.log_query(response)
+        return response
+    
     except Exception as e:
         #error code 500, generic catch all
         raise HTTPException(status_code=500, detail=str(e))
