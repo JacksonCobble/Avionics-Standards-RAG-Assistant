@@ -1,6 +1,5 @@
 import json
 import logging
-from contextlib import contextmanager
 from typing import Optional
 from models import QueryResponse
 

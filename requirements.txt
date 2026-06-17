@@ -1,8 +1,7 @@
 langchain
 langchain-community
 langchain-openai
-langchain-chroma
-chromadb
+pgvector
 fastapi
 uvicorn
 streamlit

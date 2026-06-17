@@ -3,10 +3,13 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 import time
+import traceback
 
 # DB
-import chromadb
 import db_logger
+import psycopg
+from psycopg_pool import ConnectionPool
+from pgvector.psycopg import register_vector
 
 # API/SERVER
 from contextlib import asynccontextmanager
@@ -26,9 +29,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL")
 EMBED_MODEL = os.getenv("EMBED_MODEL")
 
-CHROMA_PATH = os.getenv("CHROMA_PATH", "chroma_db")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME")
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 ########################################################################
 # FASTAPI APP, STARTUP AND SHUTDOWN
@@ -37,27 +38,23 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME")
 # use lifespan func as a constructor to prep environment for fasAPI app
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # get paths to chromaDB
-    project_root = Path(__file__).parent.parent
-    chroma_path  = Path(CHROMA_PATH)
-    if not chroma_path.is_absolute():
-        chroma_path = project_root / chroma_path
 
-    # prep chroma and OpanAI client
-    chroma_client = chromadb.PersistentClient(path=str(chroma_path))
-    collection    = chroma_client.get_collection(COLLECTION_NAME)
+    # prep OpanAI client and Supabase
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=10)
 
-    # make sure chroma DB loaded
-    count = collection.count()
-    print(f"[startup] ChromaDB ready — {count} chunks in '{COLLECTION_NAME}'")
+    # register vector type ONCE
+    with pool.connection() as conn:
+        register_vector(conn)
 
     # initialize response db
     db_logger.init_db()
 
     # attach clients to app instance
-    app.state.collection    = collection
+    app.state.pool = pool
     app.state.openai_client = openai_client
+
+    print("[startup] OpenAI and Supabase Loaded.")
 
     # everything under the yield will run on shutdown
     yield
@@ -73,15 +70,21 @@ def embed(client: OpenAI, text: str) -> list[float]:
     response = client.embeddings.create(model=EMBED_MODEL, input=text)
     return response.data[0].embedding
 
-# retrieve n relevant chunks from chromaDB for a given vector
-def retrieve(collection, vector: list[float], n: int) -> tuple[list[str], list[dict]]:
-    results = collection.query(
-        query_embeddings=[vector],
-        n_results=n,
-        include=["documents", "metadatas", "distances"]
-    )
-    # query designed to handle batches- because we are using a singular query, we can use the first element returned as there will only be 1
-    return results["documents"][0], results["metadatas"][0]
+# retrieve n relevant chunks of text with their metadata from an embedded question
+def retrieve(pool: ConnectionPool, vector: list[float], n: int) -> tuple[list[str], list[dict]]:
+    # establish connection with psycopg and enable pgvector
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT content, doc, page
+                FROM documents
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """, (vector, n))
+            rows = cur.fetchall()
+    chunks = [row[0] for row in rows]
+    metas = [{"source": row[1], "page": row[2]} for row in rows]
+    return chunks, metas
 
 # turns list of relevant chunks into a formatted block of text displaying each chunk with its relevant information
 def build_context_block(chunks: list[str], metas: list[dict]) -> str:
@@ -147,13 +150,17 @@ app = FastAPI(title="Avionics RAG API", lifespan=lifespan)
 @app.get("/health")
 async def health():
     try:
-        # check chromaDB, return informatics on it
-        count = app.state.collection.count()
-        return {"status": "ok", "chroma_count": count, "collection": COLLECTION_NAME}
+        # check supabase connection
+        with app.state.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM documents")
+                count = cur.fetchone()[0]
+        return {"status": "ok", "chunk_count": count}
+    
     # if error, chromaDB is somehow broken or not available
     except Exception as e:
         # exception 503- unable to handle request
-        raise HTTPException(status_code=503, detail=f"ChromaDB Unavailable: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Supabase unavailable: {str(e)}")
     
 @app.post("/query", response_model=QueryResponse)
 def query(req: QueryRequest):
@@ -164,7 +171,7 @@ def query(req: QueryRequest):
         # turn question into vector using embedding
         vector = embed(app.state.openai_client, req.question)
         # get relevant chunks and sources based on embed vector
-        chunks, metas = retrieve(app.state.collection, vector, req.n_results)
+        chunks, metas = retrieve(app.state.pool, vector, req.n_results)
         # build context block for prompt
         context = build_context_block(chunks, metas)
         # build query and get answer from LLM
@@ -188,5 +195,6 @@ def query(req: QueryRequest):
         return response
     
     except Exception as e:
+        traceback.print_exc()
         #error code 500, generic catch all
         raise HTTPException(status_code=500, detail=str(e))

@@ -1,22 +1,37 @@
-import os
-import hashlib
-from pathlib import Path
+# OS/ENV
+import os, sys
+import time
 from dotenv import load_dotenv
 
+# FILES
+import hashlib
+from pathlib import Path
+
+# AI
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain_chroma import Chroma
+from openai import OpenAI
+
+# DB
+import psycopg
+from pgvector.psycopg import register_vector
+
+
+########################################################################
+# CONFIG
+########################################################################
 
 load_dotenv()
 
-# CONFIG
 DOCS_DIR = Path("docs").resolve() 
-CHROMA_DIR = Path(os.getenv("CHROMA_DIR")).resolve()
-COLLECTION_NAME = os.getenv("COLLECTION_NAME")
+
 CHUNK_SIZE = 1500 # size of each chunk our docs will be split into
 CHUNK_OVERLAP = 150 # how many characters of overlap between chunks (to maintain context)
+INSERT_BATCH_SIZE = 100 # rows per executemany call
+
 EMBED_MODEL = os.getenv("EMBED_MODEL")
+EMBED_BATCH_SIZE = 100 # chunks per OpenAI embed call
+
 
 # makes hashes of files, used to skip re ingesting docs that havent changed
 def hash_file(path: Path) -> str:
@@ -28,36 +43,38 @@ def hash_file(path: Path) -> str:
             hash.update(byte_block)
     return hash.hexdigest()
 
-# reads ledger file of ingested document hashes and returns a set of those hashes for quick lookup
-def load_ingested_hashes() -> set[str]:
-    ledger_path = CHROMA_DIR / "ingested_hashes.txt"
-    # return empty set if ledger file does not exist
-    if not ledger_path.exists():
-        return set()
-    return set(ledger_path.read_text().splitlines())
+########################################################################
+# SUPABASE HELPERS
+########################################################################
 
-# writes a hash to the ledger file
-def save_ingested_hash(hash: str) -> None:
-    ledger_path = CHROMA_DIR / "ingested_hashes.txt"
-    with open(ledger_path, "a") as f:
-        f.write(f"{hash}\n")
+# load hash from supabase
+def load_ingested_hashes(conn: psycopg.Connection) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT file_hash FROM ingested_files")
+        return {row[0] for row in cur.fetchall()}
 
-if __name__ == "__main__":
+# save a completed hash to DB
+def save_ingested_hash(conn: psycopg.Connection, file_hash: str, filename: str, chunk_count: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("""
+                    INSERT INTO ingested_files (file_hash, filename, chunk_count)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (file_hash) DO NOTHING
+                    """, (file_hash, filename, chunk_count)
+                    )
+    conn.commit()
+    return
 
-    print("-" * 50)
-    print("AVIONICS RAG INGEST SCRIPT")
-    print("-" * 50)
+########################################################################
+# CHUNKING
+########################################################################
 
-    CHROMA_DIR.mkdir(exist_ok=True)
-    ingested = load_ingested_hashes()
-
-    # 1. Load and split documents
-    # ----------------------------------------------------------------------------------------------------------
-    print("[1/4] Loading and splitting documents...")
-    pdf_files = sorted(DOCS_DIR.glob("*.pdf"))
-
-    new_docs = []
-    new_hashes = []
+def load_chunk_new_files(pdf_files: list[Path], ingested: set[str]) -> tuple[list[dict], dict[str,str]]:
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
+                                              separators=["\n\n", "\n", " ", ""])
+    
+    new_chunks: list[dict] = [] # hint: list of {content, doc, page}
+    new_hashes: dict[str, str] = {}  # hint: dict of {filename, hash}  
 
     # go over each file
     for pdf in pdf_files:
@@ -77,44 +94,137 @@ if __name__ == "__main__":
         for page in pages:
             page.metadata["source"] = pdf.name
 
-        # save all new pages and new file hashes
-        new_docs.extend(pages)
-        new_hashes.append(file_hash)
+        # split docs and build chunk to add to new_chunks
+        split_docs = splitter.split_documents(pages)
+ 
+        for chunk in split_docs:
+            new_chunks.append({
+                "content": chunk.page_content,
+                "doc":     pdf.name,
+                "page":    int(chunk.metadata.get("page", 0)) + 1,
+            })
+ 
+        new_hashes[pdf.name] = file_hash
+ 
+    return new_chunks, new_hashes
 
-    print(f" - New docs to add: {len(new_docs)}")
-    print(f" - New file hashes to add: {len(new_hashes)}")
+########################################################################
+# EMBEDDING
+########################################################################
 
-    # close out of program if we dont have anything new to ingest
-    if not new_docs:
-        print(" - No new documents to add. Exiting....")
-        exit(0)
+def embed_chunks(chunks: list[dict], client: OpenAI) -> list[dict]:
 
-    # 2. Create chunks
-    # ----------------------------------------------------------------------------------------------------------
-    print("[2/4] Creating chunks...")
+    total = len(chunks)
+    # slice chunks list into groups of 100
+    for start in range(0, total, EMBED_BATCH_SIZE):
+        batch = chunks[start : start + EMBED_BATCH_SIZE]
+        # send batch to be embedded
+        response = client.embeddings.create(
+            model=EMBED_MODEL,
+            input=[c["content"] for c in batch],
+        )
+        # throw embedding value into chunk information for each chunk in batch
+        for chunk, obj in zip(batch, response.data):
+            chunk["embedding"] = obj.embedding
+ 
+        end = min(start + EMBED_BATCH_SIZE, total)
+        # sanity print
+        print(f"   - Embedded chunks {start + 1} - {end} / {total}")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
-                                              separators=["\n\n", "\n", " ", ""])
-    chunks = splitter.split_documents(new_docs)
-    print(f" - Total chunks created: {len(chunks)}")
+        # add a wait incase i hit a rate limit
+        if end < total:
+            time.sleep(1)
+ 
+    return chunks
 
-    # 3. Create embeddings and persist to ChromaDB
-    # ----------------------------------------------------------------------------------------------------------
-    print("[3/4] Creating embeddings and persisting to ChromaDB...")
-    print(f" - Model: {EMBED_MODEL}")
-    print(f" - Collection name: {COLLECTION_NAME}")
-    print(f" - ChromaDB directory: {CHROMA_DIR}")
+########################################################################
+# DB INSERTION
+########################################################################
 
-    embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
+def insert_chunks(chunks: list[dict], conn: psycopg.Connection) -> None:
 
-    # if collection already exists, add to it. if collection is brand new, add_documents will create it
-    vectorstore = Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings, persist_directory=str(CHROMA_DIR))
-    vectorstore.add_documents(chunks)
+    # add the pgvector extension type "vector" to psycopg connection
+    register_vector(conn)
+    
+    sql = """
+        INSERT INTO documents (content, embedding, doc, page)
+        VALUES (%s, %s, %s, %s)
+    """
+ 
+    total = len(chunks)
+    # slice chunks into groups of 100
+    for start in range(0, total, INSERT_BATCH_SIZE):
+        batch = chunks[start : start + INSERT_BATCH_SIZE]
+        # build db rows for a batch
+        rows = [(c["content"], c["embedding"], c["doc"], c["page"]) for c in batch]
+        with conn.cursor() as cur:
+            # sends the same command to apply to all rows
+            cur.executemany(sql, rows)
+        conn.commit()
+ 
+        end = min(start + INSERT_BATCH_SIZE, total)
+        # sanity print
+        print(f"   - Inserted rows {start + 1}-{end} / {total}")
 
-    # 4. Record all hashes so we can skip these files in the next run
-    # ----------------------------------------------------------------------------------------------------------        
-    print("[4/4] Updating ingested hashes ledger...")
-    for hash in new_hashes:
-        save_ingested_hash(hash)
+########################################################################
+# MAIN 
+########################################################################
 
-    print(f"\nDone! Ingested {len(new_hashes)} new docs, split into {len(chunks)} chunks.")
+if __name__ == "__main__":
+    
+    # load from dotenv
+    database_url = os.environ.get("DATABASE_URL")
+    openai_key   = os.environ.get("OPENAI_API_KEY")
+    if not database_url:
+        raise EnvironmentError("DATABASE URL not in .env")
+    if not openai_key:
+        raise EnvironmentError("OPENAI KEY not in .env")
+ 
+    client = OpenAI(api_key=openai_key)
+ 
+    # check for PDFs in DOCS_DIR
+    pdf_files = sorted(DOCS_DIR.glob("*.pdf"))
+    if not pdf_files:
+        raise FileNotFoundError(f"No PDFs found in {DOCS_DIR}")
+ 
+    print("-" * 50)
+    print("AVIONICS RAG INGEST SCRIPT")
+    print("-" * 50)
+ 
+    with psycopg.connect(database_url) as conn:
+ 
+        # 1. Check ledger
+        print("[1/4] Checking ingested hashes ledger...")
+        ingested = load_ingested_hashes(conn)
+        print(f"   - {len(ingested)} file(s) already ingested")
+ 
+        # 2. Load and chunk
+        print("[2/4] Loading and splitting documents...")
+        chunks, new_hashes = load_chunk_new_files(pdf_files, ingested)
+        print(f"   - New files: {len(new_hashes)}")
+        print(f"   - New chunks: {len(chunks)}")
+ 
+        if not chunks:
+            print("   - Nothing new to ingest. Exiting.")
+            sys.exit(0)
+ 
+        # 3. Embed
+        print("[3/4] Creating embeddings...")
+        print(f"   - Model: {EMBED_MODEL}")
+        chunks = embed_chunks(chunks, client)
+ 
+        # 4. Insert into pgvector + record hashes
+        print("[4/4] Inserting into pgvector and updating ledger...")
+ 
+        # Per-file chunk counts so we can record them accurately
+        counts_by_file: dict[str, int] = {}
+        for c in chunks:
+            counts_by_file[c["doc"]] = counts_by_file.get(c["doc"], 0) + 1
+ 
+        insert_chunks(chunks, conn)
+ 
+        for filename, file_hash in new_hashes.items():
+            save_ingested_hash(conn, file_hash, filename, counts_by_file[filename])
+            print(f"   - Ledger updated: {filename} ({counts_by_file[filename]} chunks)")
+ 
+    print(f"\nDone! Ingested {len(new_hashes)} new file(s), {len(chunks)} total chunks.")
